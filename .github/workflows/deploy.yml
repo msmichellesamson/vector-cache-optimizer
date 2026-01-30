@@ -1,0 +1,432 @@
+name: CI/CD Pipeline with Performance Testing
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: gcr.io
+  PROJECT_ID: vector-cache-optimizer
+  IMAGE_NAME: vector-cache-optimizer
+  GKE_CLUSTER: vector-cache-cluster
+  GKE_ZONE: us-central1-a
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install poetry
+        poetry config virtualenvs.create false
+        poetry install --with dev
+    
+    - name: Lint with ruff
+      run: |
+        ruff check src/ tests/
+        ruff format --check src/ tests/
+    
+    - name: Type check with mypy
+      run: mypy src/
+    
+    - name: Security scan with bandit
+      run: bandit -r src/ -f json -o security-report.json
+      continue-on-error: true
+    
+    - name: Run unit tests
+      env:
+        REDIS_URL: redis://localhost:6379
+        LOG_LEVEL: DEBUG
+      run: |
+        pytest tests/unit/ \
+          --cov=src \
+          --cov-report=xml \
+          --cov-report=term-missing \
+          --cov-fail-under=85 \
+          -v
+    
+    - name: Run integration tests
+      env:
+        REDIS_URL: redis://localhost:6379
+        LOG_LEVEL: DEBUG
+      run: |
+        pytest tests/integration/ \
+          --timeout=300 \
+          -v
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.12"
+        cache: pip
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install poetry
+        poetry config virtualenvs.create false
+        poetry install --with dev,perf
+    
+    - name: Cache performance baselines
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/perf-baselines
+        key: perf-baselines-${{ github.ref_name }}
+        restore-keys: |
+          perf-baselines-main
+          perf-baselines-
+    
+    - name: Run performance benchmarks
+      env:
+        REDIS_URL: redis://localhost:6379
+        BENCHMARK_DURATION: "60"
+        BENCHMARK_CONNECTIONS: "100"
+      run: |
+        mkdir -p ~/.cache/perf-baselines
+        python scripts/benchmark.py \
+          --output-format json \
+          --output-file current-perf.json \
+          --baseline-file ~/.cache/perf-baselines/baseline-${{ github.ref_name }}.json
+    
+    - name: Performance regression check
+      run: |
+        python scripts/perf_compare.py \
+          --current current-perf.json \
+          --baseline ~/.cache/perf-baselines/baseline-main.json \
+          --threshold 5.0 \
+          --output-file perf-report.json
+    
+    - name: Update performance baseline
+      if: github.ref == 'refs/heads/main'
+      run: |
+        cp current-perf.json ~/.cache/perf-baselines/baseline-main.json
+    
+    - name: Upload performance artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: |
+          current-perf.json
+          perf-report.json
+        retention-days: 30
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, performance-test]
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    - name: Configure Docker for GCR
+      run: gcloud auth configure-docker gcr.io
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: docker/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+        build-args: |
+          VERSION=${{ github.sha }}
+          BUILD_DATE=${{ steps.meta.outputs.created }}
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ needs.build.outputs.image-tag }}
+        format: sarif
+        output: trivy-results.sarif
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: trivy-results.sarif
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+    
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials $GKE_CLUSTER \
+          --zone $GKE_ZONE \
+          --project $PROJECT_ID
+    
+    - name: Deploy to staging
+      run: |
+        kubectl set image deployment/vector-cache-optimizer \
+          vector-cache-optimizer=${{ needs.build.outputs.image-tag }} \
+          -n staging
+        kubectl rollout status deployment/vector-cache-optimizer -n staging --timeout=600s
+    
+    - name: Run smoke tests
+      run: |
+        kubectl run smoke-test-${{ github.run_id }} \
+          --image=${{ needs.build.outputs.image-tag }} \
+          --restart=Never \
+          --rm -i \
+          --command -- python scripts/smoke_test.py \
+          --endpoint http://vector-cache-optimizer.staging.svc.cluster.local:8000 \
+          --timeout 30
+
+  load-test:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+    
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials $GKE_CLUSTER \
+          --zone $GKE_ZONE \
+          --project $PROJECT_ID
+    
+    - name: Run load tests with k6
+      run: |
+        kubectl apply -f - <<EOF
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: load-test-${{ github.run_id }}
+          namespace: staging
+        spec:
+          ttlSecondsAfterFinished: 300
+          template:
+            spec:
+              containers:
+              - name: k6
+                image: grafana/k6:latest
+                command:
+                - k6
+                - run
+                - --out
+                - json=/tmp/results.json
+                - -
+                stdin: |
+                  import http from 'k6/http';
+                  import { check, sleep } from 'k6';
+                  
+                  export let options = {
+                    stages: [
+                      { duration: '2m', target: 100 },
+                      { duration: '5m', target: 100 },
+                      { duration: '2m', target: 200 },
+                      { duration: '5m', target: 200 },
+                      { duration: '2m', target: 0 },
+                    ],
+                  };
+                  
+                  export default function() {
+                    let response = http.get('http://vector-cache-optimizer.staging.svc.cluster.local:8000/health');
+                    check(response, {
+                      'status is 200': (r) => r.status === 200,
+                      'response time < 500ms': (r) => r.timings.duration < 500,
+                    });
+                    sleep(1);
+                  }
+              restartPolicy: Never
+        EOF
+        
+        kubectl wait --for=condition=complete job/load-test-${{ github.run_id }} -n staging --timeout=20m
+        kubectl logs job/load-test-${{ github.run_id }} -n staging
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build, security-scan, load-test]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+    
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials $GKE_CLUSTER \
+          --zone $GKE_ZONE \
+          --project $PROJECT_ID
+    
+    - name: Deploy to production with canary
+      run: |
+        # Update canary deployment first
+        kubectl set image deployment/vector-cache-optimizer-canary \
+          vector-cache-optimizer=${{ needs.build.outputs.image-tag }} \
+          -n production
+        kubectl rollout status deployment/vector-cache-optimizer-canary -n production --timeout=600s
+        
+        # Wait for canary metrics
+        sleep 60
+        
+        # Check canary metrics
+        CANARY_ERROR_RATE=$(kubectl exec -n monitoring deployment/prometheus -- \
+          promtool query instant 'rate(http_requests_total{job="vector-cache-optimizer-canary",status=~"5.."}[5m])' | \
+          grep -o '[0-9.]*' | head -1)
+        
+        if (( $(echo "$CANARY_ERROR_RATE > 0.01" | bc -l) )); then
+          echo "Canary error rate too high: $CANARY_ERROR_RATE"
+          kubectl rollout undo deployment/vector-cache-optimizer-canary -n production
+          exit 1
+        fi
+        
+        # Promote canary to main deployment
+        kubectl set image deployment/vector-cache-optimizer \
+          vector-cache-optimizer=${{ needs.build.outputs.image-tag }} \
+          -n production
+        kubectl rollout status deployment/vector-cache-optimizer -n production --timeout=600s
+    
+    - name: Create GitHub release
+      if: github.ref == 'refs/heads/main'
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ github.run_number }}
+        release_name: Release v${{ github.run_number }}
+        body: |
+          ## Changes
+          - Deployed image: ${{ needs.build.outputs.image-tag }}
+          - Commit: ${{ github.sha }}
+          
+          ## Performance Metrics
+          See artifacts for detailed performance report.
+        draft: false
+        prerelease: false
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+    - name: Clean up old images
+      run: |
+        gcloud auth activate-service-account --key-file <(echo '${{ secrets.GCP_SA_KEY }}')
+        
+        # Keep last 10 images
+        gcloud container images list-tags ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }} \
+          --limit=999999 \
+          --sort-by=~TIMESTAMP \
+          --format="get(digest)" | \
+          tail -n +11 | \
+          while read digest; do
+            gcloud container images delete "${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}@$digest" --quiet
+          done
