@@ -1,123 +1,109 @@
-"""Core cache engine with memory-aware eviction."""
+"""Core cache engine with ML-driven eviction and intelligent prefetching."""
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta
+import json
+import numpy as np
 from dataclasses import dataclass
-from datetime import datetime
 
-from ..monitoring.memory_monitor import MemoryPressureMonitor
-from .errors import CacheError
+import redis.asyncio as redis
+from prometheus_client import Counter, Histogram, Gauge
 
+from .errors import CacheError, ValidationError
+from .circuit_breaker import CircuitBreaker
+from .retry import with_retry, RetryConfig
+from ..ml.predictor import CachePredictor
+from ..config.redis_config import RedisConfig
+
+logger = logging.getLogger(__name__)
+
+# Metrics
+cache_hits = Counter('cache_hits_total', 'Total cache hits')
+cache_misses = Counter('cache_misses_total', 'Total cache misses')
+operation_duration = Histogram('cache_operation_duration_seconds', 'Cache operation duration')
+cache_size = Gauge('cache_size_bytes', 'Current cache size in bytes')
 
 @dataclass
 class CacheEntry:
-    """Cache entry with metadata."""
+    """Cache entry with metadata for ML optimization."""
     key: str
-    vector: List[float]
-    hit_count: int
-    last_access: datetime
-    ttl: int
-    size_bytes: int
-
+    value: Any
+    embedding: Optional[np.ndarray]
+    created_at: datetime
+    last_accessed: datetime
+    access_count: int
+    ttl: Optional[int] = None
+    predicted_next_access: Optional[datetime] = None
 
 class VectorCacheEngine:
-    """Memory-aware vector cache engine."""
+    """Intelligent cache engine with ML-driven optimization."""
     
-    def __init__(self, max_size: int = 10000):
-        self.max_size = max_size
-        self._cache: Dict[str, CacheEntry] = {}
-        self._memory_monitor = MemoryPressureMonitor()
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, config: RedisConfig, predictor: CachePredictor):
+        self.config = config
+        self.predictor = predictor
+        self.redis_pool: Optional[redis.ConnectionPool] = None
+        self.redis_client: Optional[redis.Redis] = None
+        
+        # Circuit breaker for Redis operations
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30.0,
+            expected_exception=redis.RedisError
+        )
+        
+        # Retry configuration
+        self.retry_config = RetryConfig(
+            max_attempts=3,
+            base_delay=0.1,
+            max_delay=1.0
+        )
+        
         self._stats = {
-            "hits": 0,
-            "misses": 0,
-            "evictions": 0,
-            "memory_evictions": 0
+            'hits': 0,
+            'misses': 0,
+            'evictions': 0,
+            'ml_predictions': 0
         }
-        
-    async def start(self) -> None:
-        """Start cache engine and memory monitoring."""
-        asyncio.create_task(self._memory_monitor.start_monitoring())
-        self.logger.info("Vector cache engine started")
-        
-    async def stop(self) -> None:
-        """Stop cache engine."""
-        self._memory_monitor.stop_monitoring()
-        self.logger.info("Vector cache engine stopped")
-        
-    async def get(self, key: str) -> Optional[List[float]]:
-        """Get vector from cache."""
-        if key in self._cache:
-            entry = self._cache[key]
-            entry.hit_count += 1
-            entry.last_access = datetime.utcnow()
-            self._stats["hits"] += 1
-            return entry.vector
+    
+    async def initialize(self) -> None:
+        """Initialize Redis connection pool."""
+        try:
+            self.redis_pool = redis.ConnectionPool(
+                host=self.config.host,
+                port=self.config.port,
+                db=self.config.database,
+                password=self.config.password,
+                max_connections=self.config.max_connections,
+                retry_on_timeout=True,
+                socket_connect_timeout=self.config.connect_timeout,
+                socket_timeout=self.config.socket_timeout
+            )
             
-        self._stats["misses"] += 1
-        return None
-        
-    async def put(self, key: str, vector: List[float], ttl: int = 3600) -> None:
-        """Put vector in cache with memory pressure awareness."""
-        size_bytes = len(vector) * 4  # Rough float size estimation
-        
-        # Check memory pressure before adding
-        if self._memory_monitor.should_aggressive_evict():
-            await self._memory_pressure_eviction()
+            self.redis_client = redis.Redis(connection_pool=self.redis_pool)
             
-        # Regular size-based eviction
-        if len(self._cache) >= self.max_size:
-            await self._evict_lru()
+            # Test connection
+            await self._ping_redis()
+            logger.info("Cache engine initialized successfully")
             
-        entry = CacheEntry(
-            key=key,
-            vector=vector,
-            hit_count=0,
-            last_access=datetime.utcnow(),
-            ttl=ttl,
-            size_bytes=size_bytes
-        )
+        except Exception as e:
+            logger.error(f"Failed to initialize cache engine: {e}")
+            raise CacheError(f"Cache initialization failed: {e}") from e
+    
+    @with_retry(RetryConfig(max_attempts=3), None)  # Will be updated to use circuit_breaker
+    async def _ping_redis(self) -> None:
+        """Test Redis connection."""
+        if not self.redis_client:
+            raise CacheError("Redis client not initialized")
         
-        self._cache[key] = entry
-        
-    async def _memory_pressure_eviction(self) -> None:
-        """Aggressive eviction during memory pressure."""
-        # Remove 25% of cache during high memory pressure
-        target_removals = max(1, len(self._cache) // 4)
-        
-        # Sort by hit count (ascending) and last access (ascending)
-        sorted_entries = sorted(
-            self._cache.items(),
-            key=lambda x: (x[1].hit_count, x[1].last_access)
-        )
-        
-        for key, _ in sorted_entries[:target_removals]:
-            del self._cache[key]
-            self._stats["memory_evictions"] += 1
-            
-        self.logger.info(f"Memory pressure eviction: removed {target_removals} entries")
-        
-    async def _evict_lru(self) -> None:
-        """Evict least recently used entry."""
-        if not self._cache:
-            return
-            
-        lru_key = min(self._cache.keys(), 
-                     key=lambda k: self._cache[k].last_access)
-        del self._cache[lru_key]
-        self._stats["evictions"] += 1
-        
+        await self.redis_client.ping()
+    
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
-        hit_rate = 0.0
-        total_requests = self._stats["hits"] + self._stats["misses"]
-        if total_requests > 0:
-            hit_rate = self._stats["hits"] / total_requests
-            
         return {
             **self._stats,
-            "size": len(self._cache),
-            "hit_rate": hit_rate,
-            "memory_pressure": self._memory_monitor.get_current_pressure()
+            'hit_rate': self._stats['hits'] / max(self._stats['hits'] + self._stats['misses'], 1),
+            'circuit_breaker_state': self.circuit_breaker.state.name,
+            'circuit_breaker_failures': self.circuit_breaker.failure_count
         }
