@@ -1,96 +1,94 @@
-"""Memory pressure monitoring for intelligent cache eviction."""
-
+"""Enhanced memory monitor with pressure detection."""
 import asyncio
-import psutil
 import logging
-from typing import Dict, Optional
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from typing import Optional, Callable
+from .memory_pressure import MemoryPressureDetector, MemoryMetrics, PressureLevel
+from ..metrics.collector import MetricsCollector
 
+logger = logging.getLogger(__name__)
 
-@dataclass
-class MemoryMetrics:
-    """System memory metrics."""
-    used_percent: float
-    available_gb: float
-    cache_size_gb: float
-    pressure_level: str  # low, medium, high, critical
-    timestamp: datetime
-
-
-class MemoryPressureMonitor:
-    """Monitors system memory pressure to inform cache eviction decisions."""
+class MemoryMonitor:
+    """Monitor memory usage and trigger scaling actions."""
     
     def __init__(self, 
+                 metrics_collector: MetricsCollector,
                  check_interval: int = 30,
-                 high_threshold: float = 80.0,
-                 critical_threshold: float = 90.0):
+                 scaling_callback: Optional[Callable[[bool], None]] = None):
+        self.metrics_collector = metrics_collector
         self.check_interval = check_interval
-        self.high_threshold = high_threshold
-        self.critical_threshold = critical_threshold
-        self.logger = logging.getLogger(__name__)
+        self.scaling_callback = scaling_callback
+        self.pressure_detector = MemoryPressureDetector()
         self._running = False
-        self._metrics_history: list[MemoryMetrics] = []
+        self._task: Optional[asyncio.Task] = None
         
-    async def start_monitoring(self) -> None:
-        """Start continuous memory monitoring."""
-        self._running = True
-        self.logger.info("Memory pressure monitoring started")
-        
-        while self._running:
-            try:
-                metrics = self._collect_metrics()
-                self._metrics_history.append(metrics)
-                
-                # Keep only last 100 metrics
-                if len(self._metrics_history) > 100:
-                    self._metrics_history.pop(0)
-                    
-                if metrics.pressure_level in ["high", "critical"]:
-                    self.logger.warning(f"Memory pressure: {metrics.pressure_level} - {metrics.used_percent:.1f}% used")
-                    
-            except Exception as e:
-                self.logger.error(f"Memory monitoring error: {e}")
-                
-            await asyncio.sleep(self.check_interval)
+    async def start(self):
+        """Start memory monitoring."""
+        if self._running:
+            return
             
-    def stop_monitoring(self) -> None:
+        self._running = True
+        self._task = asyncio.create_task(self._monitor_loop())
+        logger.info("Memory monitor started")
+        
+    async def stop(self):
         """Stop memory monitoring."""
         self._running = False
-        self.logger.info("Memory pressure monitoring stopped")
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Memory monitor stopped")
         
-    def _collect_metrics(self) -> MemoryMetrics:
-        """Collect current memory metrics."""
-        memory = psutil.virtual_memory()
-        
-        pressure_level = "low"
-        if memory.percent >= self.critical_threshold:
-            pressure_level = "critical"
-        elif memory.percent >= self.high_threshold:
-            pressure_level = "high"
-        elif memory.percent >= 60.0:
-            pressure_level = "medium"
+    async def _monitor_loop(self):
+        """Main monitoring loop."""
+        while self._running:
+            try:
+                cache_size_mb = await self._get_cache_size_mb()
+                metrics = self.pressure_detector.get_memory_metrics(cache_size_mb)
+                
+                await self._record_metrics(metrics)
+                await self._handle_pressure(metrics)
+                
+                await asyncio.sleep(self.check_interval)
+                
+            except Exception as e:
+                logger.error(f"Memory monitoring error: {e}")
+                await asyncio.sleep(self.check_interval)
+                
+    async def _get_cache_size_mb(self) -> float:
+        """Get current cache size in MB."""
+        try:
+            # This would integrate with your cache engine
+            return 0.0  # Placeholder
+        except Exception:
+            return 0.0
             
-        return MemoryMetrics(
-            used_percent=memory.percent,
-            available_gb=memory.available / (1024**3),
-            cache_size_gb=self._estimate_cache_size(),
-            pressure_level=pressure_level,
-            timestamp=datetime.utcnow()
-        )
+    async def _record_metrics(self, metrics: MemoryMetrics):
+        """Record memory metrics."""
+        self.metrics_collector.record_gauge('memory_available_mb', metrics.available_mb)
+        self.metrics_collector.record_gauge('memory_used_percent', metrics.used_percent)
+        self.metrics_collector.record_gauge('cache_size_mb', metrics.cache_size_mb)
+        self.metrics_collector.record_gauge('memory_pressure_level', 
+                                           self._pressure_to_numeric(metrics.pressure_level))
         
-    def _estimate_cache_size(self) -> float:
-        """Rough estimation of cache memory usage."""
-        # This would integrate with Redis memory stats in real implementation
-        return 0.5  # Placeholder
-        
-    def get_current_pressure(self) -> Optional[str]:
-        """Get current memory pressure level."""
-        if not self._metrics_history:
-            return None
-        return self._metrics_history[-1].pressure_level
-        
-    def should_aggressive_evict(self) -> bool:
-        """Determine if aggressive eviction is needed."""
-        current = self.get_current_pressure()
-        return current in ["high", "critical"]
+    async def _handle_pressure(self, metrics: MemoryMetrics):
+        """Handle memory pressure events."""
+        if metrics.should_scale and self.scaling_callback:
+            logger.warning(f"Memory pressure detected: {metrics.pressure_level.value}, "
+                          f"triggering scaling")
+            try:
+                self.scaling_callback(True)
+            except Exception as e:
+                logger.error(f"Scaling callback failed: {e}")
+                
+    def _pressure_to_numeric(self, level: PressureLevel) -> float:
+        """Convert pressure level to numeric value for metrics."""
+        mapping = {
+            PressureLevel.LOW: 1.0,
+            PressureLevel.MEDIUM: 2.0,
+            PressureLevel.HIGH: 3.0,
+            PressureLevel.CRITICAL: 4.0
+        }
+        return mapping.get(level, 0.0)
