@@ -1,105 +1,60 @@
-"""Redis connection pool with health monitoring and graceful degradation."""
 import asyncio
 import logging
-import time
-from typing import Optional
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
-import redis.asyncio as redis
-from .errors import CacheConnectionError, CacheHealthError
-
+from .errors import ConnectionPoolError, ConnectionTimeoutError
 
 @dataclass
-class PoolHealth:
-    """Connection pool health metrics."""
-    active_connections: int
-    failed_connections: int
-    last_health_check: float
-    is_healthy: bool
-    avg_response_time: float
+class PoolConfig:
+    min_connections: int = 5
+    max_connections: int = 50
+    connection_timeout: float = 5.0
+    max_retries: int = 3
+    backoff_factor: float = 0.5
+    health_check_interval: float = 30.0
 
-
-class HealthyConnectionPool:
-    """Redis connection pool with health monitoring."""
-    
-    def __init__(self, redis_url: str, max_connections: int = 20):
-        self.redis_url = redis_url
-        self.max_connections = max_connections
-        self.pool: Optional[redis.ConnectionPool] = None
-        self.client: Optional[redis.Redis] = None
-        self._health = PoolHealth(0, 0, 0.0, False, 0.0)
-        self._health_check_interval = 30.0  # seconds
-        self._last_health_check = 0.0
+class ConnectionPool:
+    def __init__(self, config: PoolConfig):
+        self.config = config
+        self._pool: Dict[str, Any] = {}
+        self._active_count = 0
+        self._lock = asyncio.Lock()
         self.logger = logging.getLogger(__name__)
-    
-    async def initialize(self) -> None:
-        """Initialize connection pool."""
-        try:
-            self.pool = redis.ConnectionPool.from_url(
-                self.redis_url,
-                max_connections=self.max_connections,
-                retry_on_timeout=True,
-                decode_responses=True
-            )
-            self.client = redis.Redis(connection_pool=self.pool)
-            await self._health_check()
-            self.logger.info(f"Connection pool initialized with {self.max_connections} max connections")
-        except Exception as e:
-            raise CacheConnectionError(f"Failed to initialize connection pool: {e}")
-    
-    async def _health_check(self) -> None:
-        """Perform health check on connection pool."""
-        start_time = time.time()
         
-        try:
-            # Test connection with ping
-            await self.client.ping()
+    async def get_connection(self, redis_url: str) -> Any:
+        """Get connection with exponential backoff on failures"""
+        for attempt in range(self.config.max_retries):
+            try:
+                async with asyncio.wait_for(
+                    self._acquire_connection(redis_url),
+                    timeout=self.config.connection_timeout
+                ):
+                    return await self._acquire_connection(redis_url)
+            except asyncio.TimeoutError:
+                if attempt == self.config.max_retries - 1:
+                    raise ConnectionTimeoutError(f"Connection timeout after {self.config.max_retries} attempts")
+                
+                backoff_time = self.config.backoff_factor * (2 ** attempt)
+                self.logger.warning(f"Connection attempt {attempt + 1} failed, backing off for {backoff_time}s")
+                await asyncio.sleep(backoff_time)
+            except Exception as e:
+                if attempt == self.config.max_retries - 1:
+                    raise ConnectionPoolError(f"Failed to acquire connection: {e}")
+                await asyncio.sleep(self.config.backoff_factor * (2 ** attempt))
+                
+    async def _acquire_connection(self, redis_url: str) -> Any:
+        async with self._lock:
+            if self._active_count >= self.config.max_connections:
+                raise ConnectionPoolError("Connection pool exhausted")
             
-            # Get pool stats
-            active = len(self.pool._available_connections)
+            # Simulate connection creation
+            self._active_count += 1
+            return f"connection_{self._active_count}"
             
-            response_time = time.time() - start_time
+    async def release_connection(self, connection: Any) -> None:
+        async with self._lock:
+            self._active_count = max(0, self._active_count - 1)
             
-            self._health = PoolHealth(
-                active_connections=active,
-                failed_connections=0,
-                last_health_check=time.time(),
-                is_healthy=True,
-                avg_response_time=response_time
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Health check failed: {e}")
-            self._health = PoolHealth(
-                active_connections=0,
-                failed_connections=1,
-                last_health_check=time.time(),
-                is_healthy=False,
-                avg_response_time=0.0
-            )
-    
-    async def get_client(self) -> redis.Redis:
-        """Get Redis client with health validation."""
-        # Check if health check is needed
-        if time.time() - self._last_health_check > self._health_check_interval:
-            await self._health_check()
-            self._last_health_check = time.time()
-        
-        if not self._health.is_healthy:
-            raise CacheHealthError("Connection pool is unhealthy")
-        
-        if not self.client:
-            raise CacheConnectionError("Connection pool not initialized")
-        
-        return self.client
-    
-    def get_health(self) -> PoolHealth:
-        """Get current pool health status."""
-        return self._health
-    
-    async def close(self) -> None:
-        """Close connection pool gracefully."""
-        if self.client:
-            await self.client.close()
-        if self.pool:
-            await self.pool.disconnect()
-        self.logger.info("Connection pool closed")
+    async def health_check(self) -> bool:
+        """Basic health check for pool status"""
+        return self._active_count < self.config.max_connections
