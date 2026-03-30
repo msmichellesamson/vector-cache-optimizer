@@ -2,125 +2,249 @@
 
 Intelligent embedding cache with ML-driven eviction policies and real-time performance optimization.
 
-## Overview
-
-This system combines Redis clustering with machine learning to optimize vector embedding cache performance. It predicts cache hit patterns and dynamically adjusts eviction strategies to maximize hit rates while maintaining memory efficiency.
-
 ## Architecture
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   ML Predictor  │    │  Cache Engine   │    │  Redis Cluster  │
-│   Hit Patterns  │◄──►│  Eviction Logic │◄──►│   Sharded Data  │
+│   Cache Client  │───▶│  Cache Manager  │───▶│  Redis Cluster  │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
+                                │
+                                ▼
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Prometheus    │    │  Alert Engine   │    │  Memory Monitor │
-│    Metrics      │    │  SLA Tracking   │    │  Circuit Breaker│
+│ ML Hit Predictor│    │ Eviction Engine │    │ Monitoring Stack│
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
-
-## Core Features
-
-- **ML-Driven Eviction**: Predicts cache hit probability using access patterns
-- **Redis Clustering**: Horizontal scaling with automatic sharding
-- **Circuit Breakers**: Resilience patterns for Redis connection failures
-- **Real-time Monitoring**: Prometheus metrics with Grafana dashboards
-- **TTL Optimization**: Dynamic TTL adjustment based on access frequency
-- **Memory Management**: Intelligent memory pressure handling
 
 ## Quick Start
 
-1. **Deploy Infrastructure**:
-   ```bash
-   cd terraform
-   terraform init && terraform apply
-   ```
+```bash
+# Deploy infrastructure
+cd terraform && terraform apply
 
-2. **Deploy Application**:
-   ```bash
-   kubectl apply -f k8s/
-   ```
+# Deploy to Kubernetes
+kubectl apply -f k8s/
 
-3. **Access API**:
-   ```bash
-   curl http://localhost:8080/health
-   ```
+# Run locally
+docker build -t vector-cache .
+docker run -p 8080:8080 vector-cache
+```
 
-## API Documentation
+## API Reference
 
-See [API Documentation](docs/api.md) for complete endpoint reference.
+### Cache Operations
+
+#### Store Vector
+```python
+POST /cache/store
+Content-Type: application/json
+
+{
+    "key": "doc_123",
+    "vector": [0.1, 0.2, 0.3, ...],
+    "metadata": {"type": "document", "source": "pdf"},
+    "ttl": 3600
+}
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "key": "doc_123",
+    "stored_at": "2024-01-15T10:30:00Z",
+    "predicted_hits": 23
+}
+```
+
+#### Retrieve Vector
+```python
+GET /cache/retrieve/{key}
+```
+
+**Response:**
+```json
+{
+    "key": "doc_123",
+    "vector": [0.1, 0.2, 0.3, ...],
+    "metadata": {"type": "document"},
+    "hit_count": 15,
+    "last_accessed": "2024-01-15T11:45:00Z"
+}
+```
+
+#### Similarity Search
+```python
+POST /cache/search
+Content-Type: application/json
+
+{
+    "query_vector": [0.1, 0.2, 0.3, ...],
+    "limit": 10,
+    "threshold": 0.8,
+    "filters": {"type": "document"}
+}
+```
+
+**Response:**
+```json
+{
+    "results": [
+        {
+            "key": "doc_123",
+            "similarity": 0.92,
+            "vector": [0.1, 0.2, 0.3, ...],
+            "metadata": {"type": "document"}
+        }
+    ],
+    "total_found": 1,
+    "search_time_ms": 15
+}
+```
+
+### Metrics & Health
+
+#### Cache Stats
+```python
+GET /metrics/stats
+```
+
+**Response:**
+```json
+{
+    "hit_rate": 0.85,
+    "memory_usage": 0.72,
+    "evictions_last_hour": 42,
+    "total_keys": 15234,
+    "avg_retrieval_time_ms": 2.3
+}
+```
+
+#### Health Check
+```python
+GET /health
+```
+
+**Response:**
+```json
+{
+    "status": "healthy",
+    "redis_connected": true,
+    "ml_model_loaded": true,
+    "memory_pressure": "low",
+    "uptime_seconds": 86400
+}
+```
 
 ## Configuration
 
-### Redis Configuration
-- Cluster mode with 3 nodes minimum
-- Memory policy: `allkeys-lru` with ML override
-- Persistence: RDB + AOF for durability
+### Environment Variables
+```bash
+# Redis Configuration
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=secretpassword
+REDIS_CLUSTER_NODES=node1:6379,node2:6379,node3:6379
 
-### ML Model Configuration
-```python
-# Hit prediction model parameters
-HIT_PREDICTION_FEATURES = [
-    'access_frequency',
-    'time_since_last_access', 
-    'embedding_similarity',
-    'query_pattern_match'
-]
+# ML Configuration
+ML_MODEL_PATH=/models/hit_predictor.pkl
+ML_PREDICTION_THRESHOLD=0.7
+ML_RETRAIN_INTERVAL_HOURS=24
+
+# Cache Configuration
+DEFAULT_TTL_SECONDS=3600
+MAX_MEMORY_USAGE=0.8
+EVICTION_BATCH_SIZE=100
+
+# Monitoring
+PROMETHEUS_PORT=9090
+METRICS_EXPORT_INTERVAL=30
+ALERT_MEMORY_THRESHOLD=0.9
 ```
+
+## Troubleshooting
+
+### High Memory Usage
+**Symptoms:** Memory usage > 90%, frequent evictions
+
+**Solutions:**
+1. Check eviction policy efficiency:
+   ```bash
+   curl localhost:8080/metrics/eviction-stats
+   ```
+2. Analyze hit rate patterns:
+   ```bash
+   kubectl logs -f deployment/vector-cache | grep "hit_rate"
+   ```
+3. Scale Redis cluster:
+   ```bash
+   kubectl scale statefulset redis --replicas=6
+   ```
+
+### Low Hit Rate
+**Symptoms:** Hit rate < 60%, ML predictor accuracy dropping
+
+**Solutions:**
+1. Retrain ML model:
+   ```bash
+   curl -X POST localhost:8080/ml/retrain
+   ```
+2. Check similarity threshold:
+   ```python
+   # Adjust in config/redis_config.py
+   SIMILARITY_THRESHOLD = 0.75  # Lower for more matches
+   ```
+3. Analyze cache access patterns:
+   ```bash
+   kubectl exec -it redis-0 -- redis-cli MONITOR
+   ```
+
+### Redis Connection Issues
+**Symptoms:** Connection timeouts, circuit breaker open
+
+**Solutions:**
+1. Check Redis cluster health:
+   ```bash
+   kubectl get pods -l app=redis
+   kubectl logs redis-0
+   ```
+2. Verify network policies:
+   ```bash
+   kubectl get networkpolicies
+   ```
+3. Reset connection pool:
+   ```bash
+   curl -X POST localhost:8080/admin/reset-connections
+   ```
+
+### ML Model Performance Issues
+**Symptoms:** Prediction latency > 10ms, accuracy < 70%
+
+**Solutions:**
+1. Check model metrics:
+   ```bash
+   curl localhost:8080/ml/metrics
+   ```
+2. Force model reload:
+   ```bash
+   curl -X POST localhost:8080/ml/reload
+   ```
+3. Inspect feature distribution:
+   ```python
+   # Check logs for feature drift warnings
+   kubectl logs deployment/vector-cache | grep "feature_drift"
+   ```
 
 ## Monitoring
 
-### Key Metrics
-- Cache hit rate (target: >85%)
-- Memory utilization (alert: >90%)
-- Eviction effectiveness
-- ML prediction accuracy
-
-### Alerts
-- High memory pressure
-- Circuit breaker open
-- Cache hit rate degradation
-- Redis cluster node failures
+- **Grafana Dashboard:** `http://grafana.local/d/vector-cache`
+- **Prometheus Metrics:** `http://prometheus.local:9090`
+- **Application Logs:** `kubectl logs -f deployment/vector-cache`
 
 ## Technology Stack
 
-**Languages**: Python 3.11+, SQL
-**Infrastructure**: GCP, Terraform, Kubernetes
-**Databases**: Redis Cluster, PostgreSQL (metrics)
-**ML**: scikit-learn, NumPy
-**Monitoring**: Prometheus, Grafana
-**DevOps**: Docker, GitHub Actions
-
-## Local Development
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run tests
-pytest tests/ -v
-
-# Start local Redis
-docker-compose up redis
-
-# Run application
-python src/main.py
-```
-
-## Production Deployment
-
-The system is designed for production with:
-- Horizontal Pod Autoscaler (HPA)
-- Resource limits and requests
-- Health checks and probes
-- Persistent volumes for Redis
-- Network policies for security
-
-## Performance
-
-- **Latency**: <1ms cache operations
-- **Throughput**: 10k+ ops/second
-- **Memory**: Intelligent eviction maintains 85%+ hit rate
-- **Availability**: 99.9% uptime with circuit breakers
+- **Language:** Python 3.11+
+- **Cache:** Redis Cluster
+- **ML:** scikit-learn, numpy
+- **Monitoring:** Prometheus, Grafana
+- **Infrastructure:** Terraform, Kubernetes, GCP
+- **Deployment:** Docker, GitHub Actions
