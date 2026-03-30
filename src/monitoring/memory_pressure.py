@@ -1,90 +1,107 @@
-"""Memory pressure detection for cache scaling decisions."""
-import psutil
+import asyncio
 import logging
-from typing import Dict, Optional
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
-from enum import Enum
+from contextlib import asynccontextmanager
 
-logger = logging.getLogger(__name__)
-
-class PressureLevel(Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
 
 @dataclass
-class MemoryMetrics:
-    available_mb: float
-    used_percent: float
-    cache_size_mb: float
-    pressure_level: PressureLevel
-    should_scale: bool
+class MemoryPressureEvent:
+    pressure_level: float
+    available_memory: int
+    used_memory: int
+    timestamp: float
+    threshold_breached: bool
 
-class MemoryPressureDetector:
-    """Detects memory pressure and triggers cache scaling decisions."""
-    
-    def __init__(self, 
-                 high_threshold: float = 85.0,
-                 critical_threshold: float = 95.0,
-                 min_available_mb: float = 512.0):
-        self.high_threshold = high_threshold
+
+class MemoryPressureMonitor:
+    def __init__(self, warning_threshold: float = 0.8, critical_threshold: float = 0.95):
+        self.warning_threshold = warning_threshold
         self.critical_threshold = critical_threshold
-        self.min_available_mb = min_available_mb
-        
-    def get_memory_metrics(self, cache_size_mb: float) -> MemoryMetrics:
-        """Get current memory metrics and pressure level."""
+        self.logger = logging.getLogger(__name__)
+        self._monitoring = False
+        self._callbacks: list = []
+
+    async def get_memory_stats(self) -> Dict[str, Any]:
+        """Get current memory statistics."""
         try:
-            memory = psutil.virtual_memory()
-            available_mb = memory.available / (1024 * 1024)
-            used_percent = memory.percent
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
             
-            pressure_level = self._calculate_pressure_level(
-                used_percent, available_mb
-            )
+            lines = meminfo.split('\n')
+            stats = {}
+            for line in lines:
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    if 'kB' in value:
+                        stats[key.strip()] = int(value.replace('kB', '').strip()) * 1024
             
-            should_scale = self._should_trigger_scaling(
-                pressure_level, available_mb, cache_size_mb
-            )
+            total = stats.get('MemTotal', 0)
+            available = stats.get('MemAvailable', 0)
+            used = total - available
+            pressure = used / total if total > 0 else 0.0
             
-            return MemoryMetrics(
-                available_mb=available_mb,
-                used_percent=used_percent,
-                cache_size_mb=cache_size_mb,
-                pressure_level=pressure_level,
-                should_scale=should_scale
-            )
-            
+            return {
+                'total': total,
+                'used': used,
+                'available': available,
+                'pressure': pressure
+            }
         except Exception as e:
-            logger.error(f"Failed to get memory metrics: {e}")
-            return MemoryMetrics(
-                available_mb=0.0,
-                used_percent=100.0,
-                cache_size_mb=cache_size_mb,
-                pressure_level=PressureLevel.CRITICAL,
-                should_scale=True
-            )
-    
-    def _calculate_pressure_level(self, used_percent: float, available_mb: float) -> PressureLevel:
-        """Calculate memory pressure level based on usage."""
-        if used_percent >= self.critical_threshold or available_mb < self.min_available_mb:
-            return PressureLevel.CRITICAL
-        elif used_percent >= self.high_threshold:
-            return PressureLevel.HIGH
-        elif used_percent >= 70.0:
-            return PressureLevel.MEDIUM
-        else:
-            return PressureLevel.LOW
-    
-    def _should_trigger_scaling(self, 
-                               pressure_level: PressureLevel,
-                               available_mb: float,
-                               cache_size_mb: float) -> bool:
-        """Determine if we should trigger cache scaling."""
-        if pressure_level == PressureLevel.CRITICAL:
-            return True
+            self.logger.error(f"Failed to read memory stats: {e}")
+            return {'total': 0, 'used': 0, 'available': 0, 'pressure': 0.0}
+
+    async def register_callback(self, callback):
+        """Register callback for memory pressure events."""
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+
+    @asynccontextmanager
+    async def monitor(self, interval: float = 1.0):
+        """Async context manager for memory pressure monitoring."""
+        self._monitoring = True
+        monitor_task = None
         
-        if pressure_level == PressureLevel.HIGH and cache_size_mb > available_mb * 0.8:
-            return True
-            
-        return False
+        try:
+            monitor_task = asyncio.create_task(self._monitor_loop(interval))
+            yield self
+        finally:
+            self._monitoring = False
+            if monitor_task and not monitor_task.done():
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _monitor_loop(self, interval: float):
+        """Internal monitoring loop."""
+        while self._monitoring:
+            try:
+                stats = await self.get_memory_stats()
+                pressure = stats['pressure']
+                
+                event = MemoryPressureEvent(
+                    pressure_level=pressure,
+                    available_memory=stats['available'],
+                    used_memory=stats['used'],
+                    timestamp=asyncio.get_event_loop().time(),
+                    threshold_breached=pressure >= self.warning_threshold
+                )
+                
+                # Notify callbacks
+                for callback in self._callbacks:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(event)
+                        else:
+                            callback(event)
+                    except Exception as e:
+                        self.logger.error(f"Callback error: {e}")
+                
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Monitor loop error: {e}")
+                await asyncio.sleep(interval)
