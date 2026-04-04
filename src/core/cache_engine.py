@@ -1,96 +1,108 @@
-"""High-performance vector cache with ML-driven eviction policies."""
+"""Core cache engine with ML-driven eviction and health monitoring."""
+
 import asyncio
-import time
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
-import numpy as np
+import logging
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
 
-from .errors import CacheError, ConnectionError
-from .connection_pool import RedisConnectionPool
-from .circuit_breaker import CircuitBreaker
+import redis.asyncio as redis
+from redis.exceptions import RedisError
+
+from .connection_pool import ConnectionPool
+from .connection_validator import ConnectionValidator, ConnectionHealth
 from .eviction_selector import EvictionSelector
-from .ttl_optimizer import TTLOptimizer
-from ..monitoring.logger import get_logger, set_correlation_id
+from .circuit_breaker import CircuitBreaker
+from .errors import CacheError, ConnectionError as CacheConnectionError
 from ..ml.hit_predictor import HitPredictor
-from ..metrics.collector import MetricsCollector
+from ..monitoring.metrics_collector import MetricsCollector
 
-@dataclass
-class CacheStats:
-    """Cache performance statistics."""
-    hits: int = 0
-    misses: int = 0
-    evictions: int = 0
-    memory_usage: float = 0.0
-    avg_response_time: float = 0.0
 
-class VectorCacheEngine:
-    """Intelligent vector cache with ML-driven optimization."""
+class CacheEngine:
+    """High-performance cache engine with ML-driven optimizations."""
     
-    def __init__(self, 
-                 connection_pool: RedisConnectionPool,
-                 hit_predictor: HitPredictor,
-                 metrics_collector: MetricsCollector):
+    def __init__(
+        self,
+        connection_pool: ConnectionPool,
+        eviction_selector: EvictionSelector,
+        hit_predictor: HitPredictor,
+        metrics_collector: MetricsCollector
+    ):
         self.pool = connection_pool
+        self.eviction_selector = eviction_selector
         self.hit_predictor = hit_predictor
         self.metrics = metrics_collector
-        self.logger = get_logger('cache_engine')
-        
-        self.circuit_breaker = CircuitBreaker()
-        self.eviction_selector = EvictionSelector()
-        self.ttl_optimizer = TTLOptimizer()
-        
-        self.stats = CacheStats()
-        self._local_cache: Dict[str, Tuple[np.ndarray, float]] = {}
-        self._max_local_size = 1000
+        self.validator = ConnectionValidator(timeout=5.0)
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30,
+            expected_exception=RedisError
+        )
+        self.logger = logging.getLogger(__name__)
+        self._health_check_interval = 60  # seconds
+        self._last_health_check = datetime.now() - timedelta(minutes=5)
     
-    async def get_vector(self, key: str) -> Optional[np.ndarray]:
-        """Retrieve vector from cache with correlation tracking."""
-        correlation_id = set_correlation_id()
-        start_time = time.time()
+    async def get(self, key: str) -> Optional[bytes]:
+        """Get value with health validation and circuit breaker protection."""
+        await self._ensure_healthy_connection()
+        
+        async with self.circuit_breaker:
+            try:
+                client = await self.pool.get_connection()
+                value = await client.get(key)
+                
+                # Record metrics
+                if value:
+                    self.metrics.record_cache_hit(key)
+                else:
+                    self.metrics.record_cache_miss(key)
+                
+                return value
+                
+            except RedisError as e:
+                self.logger.error(f"Cache get failed for key {key}: {e}")
+                raise CacheError(f"Failed to get key {key}") from e
+    
+    async def set(self, key: str, value: bytes, ttl: Optional[int] = None) -> bool:
+        """Set value with connection health validation."""
+        await self._ensure_healthy_connection()
+        
+        async with self.circuit_breaker:
+            try:
+                client = await self.pool.get_connection()
+                
+                if ttl:
+                    success = await client.setex(key, ttl, value)
+                else:
+                    success = await client.set(key, value)
+                
+                if success:
+                    self.metrics.record_cache_write(key, len(value))
+                
+                return bool(success)
+                
+            except RedisError as e:
+                self.logger.error(f"Cache set failed for key {key}: {e}")
+                raise CacheError(f"Failed to set key {key}") from e
+    
+    async def _ensure_healthy_connection(self) -> None:
+        """Ensure connection is healthy before operations."""
+        now = datetime.now()
+        if (now - self._last_health_check).seconds < self._health_check_interval:
+            return
         
         try:
-            # Check local cache first
-            if key in self._local_cache:
-                vector, timestamp = self._local_cache[key]
-                self.stats.hits += 1
-                self.logger.info("Cache hit (local)", key=key, source="local")
-                return vector
+            client = await self.pool.get_connection()
+            health = await self.validator.validate_connection(client)
             
-            # Check Redis with circuit breaker
-            vector = await self.circuit_breaker.call(
-                self._get_from_redis, key
-            )
+            if health.status == ConnectionHealth.UNHEALTHY:
+                self.logger.error(f"Unhealthy connection detected: {health.error}")
+                raise CacheConnectionError(f"Connection unhealthy: {health.error}")
+            elif health.status == ConnectionHealth.DEGRADED:
+                self.logger.warning(f"Degraded connection: latency={health.latency_ms:.2f}ms")
             
-            if vector is not None:
-                self.stats.hits += 1
-                self._update_local_cache(key, vector)
-                self.logger.info("Cache hit (redis)", key=key, source="redis")
-            else:
-                self.stats.misses += 1
-                self.logger.info("Cache miss", key=key)
-            
-            return vector
+            self.metrics.record_connection_health(health.status.value, health.latency_ms)
+            self._last_health_check = now
             
         except Exception as e:
-            self.logger.error("Cache get failed", key=key, error=str(e))
-            raise CacheError(f"Failed to get vector: {e}") from e
-        finally:
-            duration = time.time() - start_time
-            self.metrics.record_latency('cache_get', duration)
-    
-    async def _get_from_redis(self, key: str) -> Optional[np.ndarray]:
-        """Get vector from Redis."""
-        async with self.pool.get_connection() as conn:
-            data = await conn.get(key)
-            if data:
-                return np.frombuffer(data, dtype=np.float32)
-            return None
-    
-    def _update_local_cache(self, key: str, vector: np.ndarray):
-        """Update local cache with LRU eviction."""
-        if len(self._local_cache) >= self._max_local_size:
-            # Remove oldest entry
-            oldest_key = next(iter(self._local_cache))
-            del self._local_cache[oldest_key]
-        
-        self._local_cache[key] = (vector, time.time())
+            self.logger.error(f"Connection health check failed: {e}")
+            raise CacheConnectionError("Connection health validation failed") from e
