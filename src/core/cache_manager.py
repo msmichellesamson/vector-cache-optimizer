@@ -1,106 +1,98 @@
-"""Intelligent vector cache manager with ML-driven eviction.
-
-This module provides the main CacheManager class that coordinates
-between Redis cache, ML predictors, and monitoring systems.
-"""
-
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Optional, Dict, Any, AsyncContextManager
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 
 from .cache_engine import CacheEngine
-from .eviction_selector import EvictionSelector
-from ..ml.hit_predictor import HitPredictor
-from ..monitoring.memory_monitor import MemoryMonitor
-from ..monitoring.hit_rate_tracker import HitRateTracker
+from .connection_pool import ConnectionPool
+from .errors import CacheError
+from ..monitoring.logger import get_logger
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class CacheManager:
-    """Main cache manager coordinating ML-driven eviction and monitoring.
+    """Main cache manager with async context management for proper cleanup."""
     
-    This class serves as the central coordinator for:
-    - Vector embedding storage and retrieval
-    - ML-based hit prediction and eviction policies
-    - Real-time performance monitoring and alerting
-    - Memory pressure management
+    def __init__(self, redis_url: str, max_connections: int = 20):
+        self.redis_url = redis_url
+        self.max_connections = max_connections
+        self._connection_pool: Optional[ConnectionPool] = None
+        self._cache_engine: Optional[CacheEngine] = None
+        self._shutdown_event = asyncio.Event()
     
-    Example:
-        >>> manager = CacheManager(redis_url="redis://localhost:6379")
-        >>> await manager.initialize()
-        >>> 
-        >>> # Store vector embedding
-        >>> vector = [0.1, 0.2, 0.3, ...]
-        >>> await manager.store("doc_123", vector, metadata={"type": "document"})
-        >>> 
-        >>> # Retrieve with similarity search
-        >>> results = await manager.retrieve_similar(query_vector, top_k=10)
-    """
+    async def __aenter__(self) -> 'CacheManager':
+        """Async context manager entry."""
+        await self.initialize()
+        return self
     
-    def __init__(self, redis_url: str, ml_model_path: Optional[str] = None):
-        """Initialize cache manager.
-        
-        Args:
-            redis_url: Redis connection string
-            ml_model_path: Optional path to pre-trained ML model
-        """
-        self.cache_engine = CacheEngine(redis_url)
-        self.eviction_selector = EvictionSelector()
-        self.hit_predictor = HitPredictor(ml_model_path)
-        self.memory_monitor = MemoryMonitor()
-        self.hit_rate_tracker = HitRateTracker()
-        self._initialized = False
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit with proper cleanup."""
+        await self.shutdown()
     
     async def initialize(self) -> None:
-        """Initialize all components and start monitoring."""
-        await self.cache_engine.initialize()
-        await self.hit_predictor.load_model()
-        await self.memory_monitor.start()
-        self._initialized = True
-        logger.info("CacheManager initialized successfully")
+        """Initialize connection pool and cache engine."""
+        try:
+            logger.info("Initializing cache manager")
+            self._connection_pool = ConnectionPool(
+                redis_url=self.redis_url,
+                max_connections=self.max_connections
+            )
+            await self._connection_pool.initialize()
+            
+            self._cache_engine = CacheEngine(self._connection_pool)
+            await self._cache_engine.initialize()
+            
+            logger.info("Cache manager initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize cache manager: {e}")
+            await self.shutdown()  # Cleanup on failure
+            raise CacheError(f"Cache manager initialization failed: {e}")
     
-    async def store(self, key: str, vector: List[float], 
-                   metadata: Optional[Dict[str, Any]] = None, 
-                   ttl: Optional[int] = None) -> bool:
-        """Store vector embedding with optional metadata.
+    async def shutdown(self) -> None:
+        """Graceful shutdown with resource cleanup."""
+        if self._shutdown_event.is_set():
+            return  # Already shutting down
         
-        Args:
-            key: Unique identifier for the vector
-            vector: Vector embedding as list of floats
-            metadata: Optional metadata dict
-            ttl: Time-to-live in seconds (optional)
-            
-        Returns:
-            True if stored successfully, False otherwise
-            
-        Raises:
-            CacheError: If storage fails
-        """
-        if not self._initialized:
-            raise RuntimeError("CacheManager not initialized")
-            
-        return await self.cache_engine.store(key, vector, metadata, ttl)
+        logger.info("Starting cache manager shutdown")
+        self._shutdown_event.set()
+        
+        # Shutdown in reverse order
+        if self._cache_engine:
+            try:
+                await asyncio.wait_for(self._cache_engine.shutdown(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Cache engine shutdown timed out")
+            except Exception as e:
+                logger.error(f"Error during cache engine shutdown: {e}")
+        
+        if self._connection_pool:
+            try:
+                await asyncio.wait_for(self._connection_pool.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Connection pool shutdown timed out")
+            except Exception as e:
+                logger.error(f"Error during connection pool shutdown: {e}")
+        
+        logger.info("Cache manager shutdown complete")
     
-    async def retrieve_similar(self, query_vector: List[float], 
-                              top_k: int = 10,
-                              similarity_threshold: float = 0.8) -> List[Tuple[str, float, Dict]]:
-        """Retrieve most similar vectors using ML-optimized search.
-        
-        Args:
-            query_vector: Query vector for similarity search
-            top_k: Maximum number of results to return
-            similarity_threshold: Minimum similarity score (0.0-1.0)
-            
-        Returns:
-            List of (key, similarity_score, metadata) tuples
-        """
-        results = await self.cache_engine.similarity_search(
-            query_vector, top_k, similarity_threshold
+    @property
+    def cache_engine(self) -> CacheEngine:
+        """Get cache engine instance."""
+        if not self._cache_engine:
+            raise CacheError("Cache manager not initialized")
+        return self._cache_engine
+    
+    def is_healthy(self) -> bool:
+        """Check if cache manager is healthy."""
+        return (
+            self._connection_pool is not None and
+            self._cache_engine is not None and
+            not self._shutdown_event.is_set()
         )
-        
-        # Update hit rate tracking
-        await self.hit_rate_tracker.record_hits(len(results))
-        
-        return results
+
+@asynccontextmanager
+async def create_cache_manager(redis_url: str, max_connections: int = 20) -> AsyncContextManager[CacheManager]:
+    """Factory function to create cache manager with context management."""
+    manager = CacheManager(redis_url, max_connections)
+    async with manager:
+        yield manager
