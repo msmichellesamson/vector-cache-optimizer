@@ -1,0 +1,28 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-pdb
+  namespace: vector-cache
+  labels:
+    app: redis-cluster
+    component: database
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: redis
+      role: node
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vector-cache-pdb
+  namespace: vector-cache
+  labels:
+    app: vector-cache-optimizer
+    component: application
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: vector-cache-optimizer
