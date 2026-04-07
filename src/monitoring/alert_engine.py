@@ -1,157 +1,117 @@
-from typing import Dict, List, Optional, Tuple
+import asyncio
+import logging
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import logging
-from enum import Enum
-
-from src.ml.predictor import CachePredictor
-from src.metrics.collector import MetricsCollector
+import aiohttp
+import json
 
 logger = logging.getLogger(__name__)
 
-class AlertSeverity(Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
-
 @dataclass
 class Alert:
-    name: str
-    severity: AlertSeverity
+    severity: str
     message: str
-    timestamp: datetime
-    metrics: Dict[str, float]
+    metric: str
+    value: float
     threshold: float
-    actual: float
+    timestamp: datetime
+
+@dataclass
+class RetryConfig:
+    max_attempts: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 60.0
+    backoff_factor: float = 2.0
 
 class AlertEngine:
-    def __init__(self, predictor: CachePredictor, metrics: MetricsCollector):
-        self.predictor = predictor
-        self.metrics = metrics
-        self.active_alerts: Dict[str, Alert] = {}
-        self.alert_history: List[Alert] = []
+    def __init__(self, webhook_url: str, retry_config: Optional[RetryConfig] = None):
+        self.webhook_url = webhook_url
+        self.retry_config = retry_config or RetryConfig()
+        self._active_alerts: Dict[str, Alert] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def __aenter__(self):
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._session:
+            await self._session.close()
+
+    async def send_alert(self, alert: Alert) -> bool:
+        """Send alert with exponential backoff retry logic"""
+        if not self._session:
+            raise RuntimeError("AlertEngine not properly initialized")
+
+        alert_key = f"{alert.metric}_{alert.severity}"
         
-        # ML-driven thresholds (updated by predictor)
-        self.dynamic_thresholds = {
-            "hit_rate_min": 0.85,  # Updated by ML model
-            "latency_max_ms": 50,
-            "memory_usage_max": 0.8,
-            "prediction_accuracy_min": 0.75
+        # Deduplicate alerts within 5 minutes
+        if alert_key in self._active_alerts:
+            last_alert = self._active_alerts[alert_key]
+            if datetime.utcnow() - last_alert.timestamp < timedelta(minutes=5):
+                logger.debug(f"Suppressing duplicate alert: {alert_key}")
+                return True
+
+        payload = {
+            "text": f"🚨 {alert.severity.upper()}: {alert.message}",
+            "attachments": [{
+                "color": "danger" if alert.severity == "critical" else "warning",
+                "fields": [
+                    {"title": "Metric", "value": alert.metric, "short": True},
+                    {"title": "Value", "value": str(alert.value), "short": True},
+                    {"title": "Threshold", "value": str(alert.threshold), "short": True},
+                    {"title": "Time", "value": alert.timestamp.isoformat(), "short": True}
+                ]
+            }]
         }
-    
-    def update_thresholds(self, cache_stats: Dict[str, float]) -> None:
-        """Update alert thresholds based on ML predictions"""
-        try:
-            # Use predictor to adjust hit rate threshold
-            predicted_optimal = self.predictor.predict_optimal_hit_rate(cache_stats)
-            self.dynamic_thresholds["hit_rate_min"] = max(0.7, predicted_optimal * 0.9)
+
+        success = await self._send_with_retry(payload)
+        
+        if success:
+            self._active_alerts[alert_key] = alert
+            logger.info(f"Alert sent successfully: {alert_key}")
+        else:
+            logger.error(f"Failed to send alert after all retries: {alert_key}")
             
-            # Adjust latency threshold based on recent performance
-            recent_p95 = cache_stats.get("latency_p95_ms", 50)
-            self.dynamic_thresholds["latency_max_ms"] = min(100, recent_p95 * 1.5)
+        return success
+
+    async def _send_with_retry(self, payload: dict) -> bool:
+        """Send webhook with exponential backoff"""
+        delay = self.retry_config.base_delay
+        
+        for attempt in range(self.retry_config.max_attempts):
+            try:
+                async with self._session.post(
+                    self.webhook_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    if response.status < 400:
+                        return True
+                    
+                    logger.warning(
+                        f"Alert webhook failed (attempt {attempt + 1}): "
+                        f"HTTP {response.status}"
+                    )
+                    
+            except Exception as e:
+                logger.warning(
+                    f"Alert webhook error (attempt {attempt + 1}): {e}"
+                )
             
-            logger.info(f"Updated thresholds: {self.dynamic_thresholds}")
-        except Exception as e:
-            logger.error(f"Failed to update thresholds: {e}")
-    
-    def check_alerts(self) -> List[Alert]:
-        """Check all alert conditions and return new alerts"""
-        new_alerts = []
-        current_metrics = self.metrics.get_current_metrics()
+            # Don't sleep after the last attempt
+            if attempt < self.retry_config.max_attempts - 1:
+                await asyncio.sleep(min(delay, self.retry_config.max_delay))
+                delay *= self.retry_config.backoff_factor
         
-        # Update thresholds first
-        self.update_thresholds(current_metrics)
-        
-        # Check each alert condition
-        alert_checks = [
-            self._check_hit_rate,
-            self._check_latency,
-            self._check_memory_usage,
-            self._check_prediction_accuracy
-        ]
-        
-        for check in alert_checks:
-            alert = check(current_metrics)
-            if alert and alert.name not in self.active_alerts:
-                new_alerts.append(alert)
-                self.active_alerts[alert.name] = alert
-                self.alert_history.append(alert)
-        
-        return new_alerts
-    
-    def _check_hit_rate(self, metrics: Dict[str, float]) -> Optional[Alert]:
-        hit_rate = metrics.get("hit_rate", 0.0)
-        threshold = self.dynamic_thresholds["hit_rate_min"]
-        
-        if hit_rate < threshold:
-            return Alert(
-                name="low_hit_rate",
-                severity=AlertSeverity.HIGH if hit_rate < 0.6 else AlertSeverity.MEDIUM,
-                message=f"Cache hit rate {hit_rate:.2%} below threshold {threshold:.2%}",
-                timestamp=datetime.utcnow(),
-                metrics=metrics,
-                threshold=threshold,
-                actual=hit_rate
-            )
-        return None
-    
-    def _check_latency(self, metrics: Dict[str, float]) -> Optional[Alert]:
-        latency_p95 = metrics.get("latency_p95_ms", 0.0)
-        threshold = self.dynamic_thresholds["latency_max_ms"]
-        
-        if latency_p95 > threshold:
-            return Alert(
-                name="high_latency",
-                severity=AlertSeverity.CRITICAL if latency_p95 > 200 else AlertSeverity.HIGH,
-                message=f"P95 latency {latency_p95:.1f}ms exceeds threshold {threshold:.1f}ms",
-                timestamp=datetime.utcnow(),
-                metrics=metrics,
-                threshold=threshold,
-                actual=latency_p95
-            )
-        return None
-    
-    def _check_memory_usage(self, metrics: Dict[str, float]) -> Optional[Alert]:
-        memory_usage = metrics.get("memory_usage_ratio", 0.0)
-        threshold = self.dynamic_thresholds["memory_usage_max"]
-        
-        if memory_usage > threshold:
-            return Alert(
-                name="high_memory_usage",
-                severity=AlertSeverity.CRITICAL if memory_usage > 0.95 else AlertSeverity.HIGH,
-                message=f"Memory usage {memory_usage:.1%} exceeds threshold {threshold:.1%}",
-                timestamp=datetime.utcnow(),
-                metrics=metrics,
-                threshold=threshold,
-                actual=memory_usage
-            )
-        return None
-    
-    def _check_prediction_accuracy(self, metrics: Dict[str, float]) -> Optional[Alert]:
-        accuracy = metrics.get("prediction_accuracy", 1.0)
-        threshold = self.dynamic_thresholds["prediction_accuracy_min"]
-        
-        if accuracy < threshold:
-            return Alert(
-                name="low_prediction_accuracy",
-                severity=AlertSeverity.MEDIUM,
-                message=f"ML prediction accuracy {accuracy:.1%} below threshold {threshold:.1%}",
-                timestamp=datetime.utcnow(),
-                metrics=metrics,
-                threshold=threshold,
-                actual=accuracy
-            )
-        return None
-    
-    def resolve_alert(self, alert_name: str) -> bool:
-        """Mark an alert as resolved"""
-        if alert_name in self.active_alerts:
-            del self.active_alerts[alert_name]
-            logger.info(f"Resolved alert: {alert_name}")
-            return True
         return False
-    
-    def get_active_alerts(self) -> List[Alert]:
-        """Get all currently active alerts"""
-        return list(self.active_alerts.values())
+
+    def clear_alert(self, metric: str, severity: str):
+        """Clear active alert to allow re-sending"""
+        alert_key = f"{metric}_{severity}"
+        if alert_key in self._active_alerts:
+            del self._active_alerts[alert_key]
+            logger.info(f"Cleared active alert: {alert_key}")
