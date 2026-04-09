@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-cache-optimizer-config
+  namespace: default
+  labels:
+    app: vector-cache-optimizer
+    component: config
+data:
+  app.yaml: |
+    cache:
+      default_ttl: 3600
+      max_memory_mb: 512
+      eviction_batch_size: 100
+      warm_cache_percentage: 0.1
+    ml:
+      hit_predictor:
+        learning_rate: 0.001
+        batch_size: 32
+        model_update_interval: 300
+      similarity_threshold: 0.85
+      cluster_update_interval: 600
+    monitoring:
+      metrics_interval: 30
+      health_check_interval: 60
+      alert_thresholds:
+        hit_rate_min: 0.7
+        memory_usage_max: 0.9
+        latency_p99_max: 100
+    redis:
+      connection_pool_size: 10
+      command_timeout: 5
+      retry_attempts: 3
+      circuit_breaker:
+        failure_threshold: 5
+        recovery_timeout: 30
+    logging:
+      level: INFO
+      format: json
+      enable_structlog: true
