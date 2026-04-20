@@ -4,11 +4,15 @@
 
 ## The question I'm exploring
 
-Belady's MIN algorithm is the theoretical optimum for cache eviction — but it's
-clairvoyant (it requires knowing the future). LRU is the "good enough" stand-in
-that most production systems use. There's a small but interesting body of work
-(Google's "Learning Memory Access Patterns", Mihail's *LeCaR*, Berkeley's *Glider*)
-showing that learned policies can close part of the gap to MIN on real workloads.
+[Belady's MIN algorithm](https://ieeexplore.ieee.org/document/5388441) is the
+theoretical optimum for cache eviction — but it's clairvoyant (it requires
+knowing the future). LRU is the "good enough" stand-in that most production
+systems use. There's a small but interesting body of work — Google's
+[*Learning Memory Access Patterns*](https://arxiv.org/abs/1803.02329),
+[*LeCaR*](https://www.usenix.org/conference/hotstorage18/presentation/vietri),
+Berkeley's [*Glider*](https://www.cs.utexas.edu/~lin/papers/micro19.pdf) —
+showing that learned policies can close part of the gap to MIN on real
+workloads.
 
 I wanted to know: does any of that translate to **embedding caches**, where the
 "value" of a cached entry isn't just access frequency but also semantic
@@ -76,7 +80,8 @@ done the comparison study honestly enough to publish numbers in this README.
 
 ## References
 
-- Liu et al., *LeCaR: Cache Replacement with Reinforcement Learning* (HotStorage 2018)
-- Shi et al., *Applying Deep Learning to the Cache Replacement Problem* (MICRO 2019)
-- Hashemi et al., *Learning Memory Access Patterns* (ICML 2018)
-- Belady, *A study of replacement algorithms* (1966)
+- Vietri et al., [*Driving Cache Replacement with ML-based LeCaR*](https://www.usenix.org/conference/hotstorage18/presentation/vietri) (HotStorage 2018)
+- Shi et al., [*Applying Deep Learning to the Cache Replacement Problem*](https://www.cs.utexas.edu/~lin/papers/micro19.pdf) (MICRO 2019, Glider)
+- Hashemi et al., [*Learning Memory Access Patterns*](https://arxiv.org/abs/1803.02329) (ICML 2018)
+- Belady, [*A study of replacement algorithms for a virtual-storage computer*](https://ieeexplore.ieee.org/document/5388441) (IBM, 1966)
+- [MTEB](https://github.com/embeddings-benchmark/mteb) — embedding benchmark suite used for trace shape
