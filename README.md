@@ -1,159 +1,82 @@
-# Vector Cache Optimizer
+# vector-cache-optimizer
 
-Intelligent embedding cache with ML-driven eviction policies and real-time performance optimization for high-scale AI workloads.
+> Comparing learned eviction policies against LRU/LFU for embedding caches.
 
-## 🎯 Target Skills Demonstrated
-- **AI/ML**: Hit prediction, vector clustering, pattern learning, similarity analysis
-- **Database**: Redis optimization, connection pooling, memory management
-- **Backend**: Async APIs, batch processing, circuit breakers
-- **Infrastructure**: Terraform (GCP + monitoring), Kubernetes deployment
-- **SRE**: Prometheus metrics, Grafana dashboards, alerting, health checks
-- **DevOps**: Docker containerization, CI/CD pipeline
+## The question I'm exploring
 
-## 🏗️ Architecture
+Belady's MIN algorithm is the theoretical optimum for cache eviction — but it's
+clairvoyant (it requires knowing the future). LRU is the "good enough" stand-in
+that most production systems use. There's a small but interesting body of work
+(Google's "Learning Memory Access Patterns", Mihail's *LeCaR*, Berkeley's *Glider*)
+showing that learned policies can close part of the gap to MIN on real workloads.
 
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   ML Pipeline   │    │  Cache Engine   │    │   Monitoring    │
-│                 │    │                 │    │                 │
-│ • Hit Predictor │────│ • Redis Cluster │────│ • Prometheus    │
-│ • Clustering    │    │ • Connection Pool│    │ • Grafana       │
-│ • Pattern Learn │    │ • Batch Processor│    │ • Alerting      │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-```
+I wanted to know: does any of that translate to **embedding caches**, where the
+"value" of a cached entry isn't just access frequency but also semantic
+overlap with future queries?
 
-## 🚀 Quick Start
+## Why I care
 
-### Local Development
-```bash
-# Start Redis
-docker run -d -p 6379:6379 redis:7-alpine
+Eviction is one of those problems that looks solved until you have a workload
+that doesn't fit the textbook assumptions. RAG embedding caches don't fit:
 
-# Install dependencies
-pip install -r requirements.txt
+- Entries aren't independent — semantically similar entries can substitute
+  for each other on a near-miss
+- Compute cost per miss is uneven (re-embedding a long document costs more than
+  a short query)
+- Access patterns have strong session locality but weak global locality
 
-# Run with ML features
-python -m src.main --enable-ml --hit-prediction
-```
+If a learned policy can save even 5–10% over LRU on this workload, that's a
+real reduction in GPU time and serving cost — and a real reduction in the
+carbon footprint of every retrieval-heavy product.
 
-### Production Deployment
-```bash
-# Deploy infrastructure
-cd terraform/gcp
-terraform init && terraform apply
+## What's in here
 
-# Deploy to Kubernetes
-kubectl apply -f k8s/
+A test harness for comparing eviction policies on the same trace:
 
-# Verify deployment
-kubectl get pods -l app=vector-cache
-```
+- `src/core/cache.py` — base async cache with pluggable eviction
+- `src/policies/` — LRU, LFU, ARC, and an ML-driven policy that scores
+  entries by predicted reuse probability
+- `src/clustering/` — vector clustering used as a feature for the predictor
+  ("entries in dense clusters are more likely to be reused")
+- `src/benchmarks/` — replay harness for synthetic traces
 
-## 📊 Key Features
+Infra is the usual: Terraform for GCP, k8s manifests, Prometheus + Grafana
+dashboards. I included it because eviction policy decisions are only
+interesting if you can observe their effects in production.
 
-### ML-Driven Optimization
-- **Hit Prediction**: ML model predicts cache hit probability
-- **Smart Eviction**: Context-aware LRU with usage pattern analysis
-- **Vector Clustering**: Groups similar embeddings for better locality
-- **Pattern Learning**: Adapts to application access patterns
+## What I'm finding (so far)
 
-### Production-Ready Reliability
-- **Circuit Breakers**: Automatic failure detection and recovery
-- **Connection Pooling**: Optimized Redis connection management
-- **Memory Pressure Handling**: Intelligent cache sizing
-- **Health Monitoring**: Comprehensive observability stack
+Honest answer: not enough yet. What I do see on synthetic Zipf-distributed
+access patterns:
 
-### Performance Optimizations
-- **Batch Processing**: Efficient bulk operations
-- **Compression**: Vector data compression for memory efficiency
-- **Async Operations**: Non-blocking cache operations
-- **Connection Recovery**: Automatic reconnection with backoff
+- **LFU beats LRU** by ~3-5% hit rate on long sessions but loses on bursty
+  ones (well-known result, replicating it was a good sanity check).
+- The ML policy as currently written is **slower than LRU** at runtime
+  because of the per-eviction inference call. Amortizing predictions over
+  batches helps but I haven't quantified by how much.
+- Vector clustering as a feature is suspicious — the cluster IDs themselves
+  drift as the cache contents change. I think I need a stable feature
+  (e.g., distance to a fixed set of anchor points) instead.
 
-## 📖 Documentation
-- [API Reference](docs/API.md) - Complete API documentation and troubleshooting
+## What I'd do next
 
-## 🔧 Configuration
+- Run on real traces (production logs from any RAG system would work; failing
+  that, MTEB query distributions)
+- Measure the **end-to-end** cost: hit rate × miss penalty − policy overhead.
+  Hit rate alone is misleading.
+- Try the LeCaR-style "two-experts" approach (LRU + LFU mixed by reinforcement
+  learning) before going deeper on the neural predictor
+- Compare against a clairvoyant Belady oracle on the same trace to see how much
+  headroom is left
 
-### Environment Variables
-```bash
-REDIS_URL=redis://localhost:6379
-MAX_CONNECTIONS=100
-ENABLE_ML_FEATURES=true
-HIT_PREDICTION_THRESHOLD=0.7
-METRICS_PORT=8080
-```
+## Status
 
-### Redis Configuration
-```python
-redis_config = RedisConfig(
-    host="redis-cluster",
-    port=6379,
-    max_connections=100,
-    timeout=5.0,
-    retry_attempts=3
-)
-```
+Early experiment. The harness runs and the policies are real, but I haven't
+done the comparison study honestly enough to publish numbers in this README.
 
-## 📈 Monitoring
+## References
 
-### Key Metrics
-- **Cache Hit Rate**: Target >85%
-- **P99 Latency**: <10ms for single operations
-- **Memory Usage**: Monitor pressure alerts
-- **Connection Health**: Track pool utilization
-
-### Grafana Dashboards
-- Cache Performance Overview
-- ML Model Accuracy Tracking
-- Infrastructure Health
-- Alert Status
-
-## 🧪 Testing
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Test with Redis integration
-pytest tests/integration/ --redis-url redis://localhost:6379
-
-# Performance benchmarks
-python tests/benchmarks/cache_performance.py
-```
-
-## 🛠️ Development
-
-### Prerequisites
-- Python 3.11+
-- Redis 7+
-- Terraform 1.5+
-- Kubernetes cluster
-
-### Project Structure
-```
-src/
-├── core/           # Cache engine, connection management
-├── ml/             # ML models, prediction, clustering
-├── monitoring/     # Observability, alerting
-├── metrics/        # Performance tracking
-└── config/         # Configuration management
-
-terraform/
-├── gcp/            # GCP infrastructure
-└── monitoring/     # Prometheus, Grafana setup
-
-k8s/                # Kubernetes manifests
-tests/              # Test suites
-```
-
-## 🚨 Alerts
-
-- **High Memory Usage**: >80% of allocated memory
-- **Low Hit Rate**: <70% hit rate for 5 minutes
-- **Connection Failures**: >5% failed connections
-- **ML Model Drift**: Prediction accuracy <60%
-
----
-
-**Stack**: Python, Redis, GCP, Kubernetes, Terraform, Prometheus, Grafana  
-**Focus**: AI/ML + Infrastructure + SRE + Database + Backend + DevOps
+- Liu et al., *LeCaR: Cache Replacement with Reinforcement Learning* (HotStorage 2018)
+- Shi et al., *Applying Deep Learning to the Cache Replacement Problem* (MICRO 2019)
+- Hashemi et al., *Learning Memory Access Patterns* (ICML 2018)
+- Belady, *A study of replacement algorithms* (1966)
